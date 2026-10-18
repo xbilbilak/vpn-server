@@ -135,13 +135,7 @@ jobs:
             echo "🔐 Full vless configs were sent to your Telegram."
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            MSG="✅ VPN Server (GitHub Action) ONLINE
-
-${WS}
-
-${XH}
-
-⏳ تقریبا ۶ ساعت معتبره — هر ۶ ساعت خودکار تازه میشه و کانفیگ جدید میاد همینجا."
+            MSG="✅ VPN Server (GitHub Action) ONLINE"$'\n\n'"${WS}"$'\n\n'"${XH}"$'\n\n'"⏳ تقریبا ۶ ساعت معتبره — هر ۶ ساعت خودکار تازه میشه و کانفیگ جدید میاد همینجا."
             curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_CHAT_ID}" \
               --data-urlencode "text=${MSG}" > /tmp/tg.json
