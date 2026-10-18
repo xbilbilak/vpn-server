@@ -1,0 +1,162 @@
+name: VPN Server (Xray + Tailscale Funnel)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+concurrency:
+  group: vpn-server
+  cancel-in-progress: true
+
+jobs:
+  vpn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Xray
+        run: |
+          curl -sL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo mkdir -p /opt/xray
+          sudo unzip -o /tmp/xray.zip -d /opt/xray
+          sudo chmod +x /opt/xray/xray
+          /opt/xray/xray version
+
+      - name: Write Xray config and start server
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+        run: |
+          sudo mkdir -p /opt/xray/etc
+          sudo tee /opt/xray/etc/config.json >/dev/null <<EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 8081,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "${XRAY_UUID}", "level": 8}], "decryption": "none"},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}},
+                "sniffing": {"enabled": true}
+              },
+              {
+                "listen": "127.0.0.1",
+                "port": 8082,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "${XRAY_UUID}", "level": 8}], "decryption": "none"},
+                "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/", "mode": "auto"}},
+                "sniffing": {"enabled": true}
+              }
+            ],
+            "outbounds": [
+              {"protocol": "freedom", "tag": "direct"},
+              {"protocol": "blackhole", "tag": "block"}
+            ]
+          }
+          EOF
+          sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json > /tmp/xray.log 2>&1 &
+          sleep 3
+          ss -tlnp | grep -E '8081|8082' && echo "XRAY LISTENING OK"
+
+      - name: Join Tailscale (OAuth -> fresh ephemeral key)
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          ACCESS=$(curl -s -u "${TS_OAUTH_CLIENT_ID}:${TS_OAUTH_CLIENT_SECRET}" \
+            -d grant_type=client_credentials https://api.tailscale.com/api/v2/oauth/token | jq -r .access_token)
+          [ -n "$ACCESS" ] && [ "$ACCESS" != "null" ] || { echo "OAUTH FAILED"; exit 1; }
+          KEY=$(curl -s -H "Authorization: Bearer $ACCESS" -H "Content-Type: application/json" \
+            -d '{"capabilities":{"devices":{"create":{"preauthorized":true,"reusable":true,"ephemeral":true,"tags":["tag:server"]}}},"expirySeconds":600}' \
+            https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
+          [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
+          echo "::add-mask::$KEY"
+          sudo tailscale up --authkey="$KEY" --hostname=vpn --accept-dns=false
+          sudo tailscale status | head -5
+
+      - name: Enable Funnel (443 -> WS, 8443 -> XHTTP)
+        run: |
+          sudo tailscale funnel --bg 8081 > /tmp/funnel443.log 2>&1 || sudo cat /tmp/funnel443.log
+          sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082 > /tmp/funnel8443.log 2>&1 || sudo cat /tmp/funnel8443.log
+          sleep 5
+          sudo tailscale serve status
+          echo "Self DNS: $(sudo tailscale status --json | jq -r '.Self.DNSName')"
+
+      - name: E2E self-test through public Funnel
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+        run: |
+          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "DNS=$DN"
+          sudo tee /tmp/probe-ws.json >/dev/null <<EOF
+          {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10821,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$DN","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$DN","fingerprint":"chrome"},"wsSettings":{"path":"/ws","host":"$DN"}}}]}
+          EOF
+          sudo tee /tmp/probe-xh.json >/dev/null <<EOF
+          {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10822,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$DN","port":8443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"$DN","fingerprint":"chrome"},"xhttpSettings":{"path":"/","mode":"auto","host":"$DN"}}}]}
+          EOF
+          sudo nohup /opt/xray/xray run -c /tmp/probe-ws.json > /tmp/probe-ws.log 2>&1 &
+          sudo nohup /opt/xray/xray run -c /tmp/probe-xh.json > /tmp/probe-xh.log 2>&1 &
+          sleep 4
+          ok=""
+          for i in $(seq 1 30); do
+            W=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || true)
+            X=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 https://api.ipify.org || true)
+            if [ -n "$W" ] && [ -n "$X" ]; then ok=1; echo "attempt $i: WS=$W XHTTP=$X"; break; fi
+            echo "attempt $i: waiting for funnel certs..."
+            sleep 10
+          done
+          if [ -z "$ok" ]; then
+            echo "E2E FAILED — dumping diagnostics"
+            sudo tailscale serve status || true
+            sudo cat /tmp/funnel443.log /tmp/funnel8443.log /tmp/xray.log /tmp/probe-ws.log /tmp/probe-xh.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "WS   gstatic: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204)"
+          echo "XHTTP gstatic: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204)"
+
+      - name: Send configs to Telegram + Summary
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          WS="vless://${XRAY_UUID}@${DN}:443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=ws&host=${DN}&path=%2Fws#GH-Funnel-WS"
+          XH="vless://${XRAY_UUID}@${DN}:8443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${DN}#GH-Funnel-XHTTP"
+          {
+            echo "## ✅ VPN Server ONLINE"
+            echo ""
+            echo "- Node: **${DN}**"
+            echo "- WS: 443 → /ws | XHTTP: 8443 → /"
+            echo "- Renewed automatically every 6 hours"
+            echo ""
+            echo "🔐 Full vless configs were sent to your Telegram."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            MSG="✅ VPN Server (GitHub Action) ONLINE
+
+${WS}
+
+${XH}
+
+⏳ تقریبا ۶ ساعت معتبره — هر ۶ ساعت خودکار تازه میشه و کانفیگ جدید میاد همینجا."
+            curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=${MSG}" > /tmp/tg.json
+            grep -q '"ok":true' /tmp/tg.json && echo "TELEGRAM SENT OK" || { echo "TELEGRAM FAILED:"; cat /tmp/tg.json; }
+          else
+            echo "TG secrets not set, skipping telegram"
+          fi
+
+      - name: Keep alive (6h watchdog)
+        run: |
+          for i in $(seq 1 325); do
+            pgrep -x xray >/dev/null || {
+              echo "[$i] xray died — respawning"
+              sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json >> /tmp/xray.log 2>&1 &
+            }
+            [ $((i % 30)) -eq 0 ] && echo "[$i/325] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"
+            sleep 60
+          done
