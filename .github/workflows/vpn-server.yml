@@ -7,7 +7,11 @@ on:
 
 concurrency:
   group: vpn-server
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   vpn:
@@ -73,6 +77,15 @@ jobs:
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
           echo "::add-mask::$KEY"
+          # pin hostname: delete OFFLINE vpn* nodes so the 'vpn' name stays free
+          for id in $(curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices | jq -r '.devices[] | select(.hostname | startswith("vpn")) | .id'); do
+            ON=$(curl -s -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" | jq -r '.online')
+            if [ "$ON" = "false" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" >/dev/null
+              echo "deleted stale offline node $id"
+              sleep 2
+            fi
+          done
           sudo tailscale up --authkey="$KEY" --hostname=vpn --accept-dns=false
           sudo tailscale status | head -5
 
@@ -154,3 +167,19 @@ jobs:
             [ $((i % 30)) -eq 0 ] && echo "[$i/325] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"
             sleep 60
           done
+
+      - name: Chain next run (zero-gap 24/7)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
+            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "pending" or .status == "in_progress"))] | length')
+          if [ "$PENDING" = "0" ]; then
+            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/dispatches" \
+              -d '{"ref":"main"}' && echo "chained: next run dispatched (zero-gap 24/7)"
+          else
+            echo "a run is already queued/in-progress ($PENDING) — chain skipped"
+          fi
