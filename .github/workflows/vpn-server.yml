@@ -77,15 +77,15 @@ jobs:
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
           echo "::add-mask::$KEY"
-          # pin hostname: delete OFFLINE vpn* nodes so the 'vpn' name stays free
-          for id in $(curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices | jq -r '.devices[] | select(.hostname | startswith("vpn")) | .id'); do
-            ON=$(curl -s -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" | jq -r '.online')
-            if [ "$ON" = "false" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" >/dev/null
-              echo "deleted stale offline node $id"
-              sleep 2
-            fi
-          done
+          # pin hostname: delete ALL stale vpn* nodes (runs are serialized -> none active)
+          curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices \
+            | jq -r '.devices[] | select(.hostname | startswith("vpn")) | .id' \
+            | while read -r id; do
+                [ -n "$id" ] || continue
+                curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" >/dev/null
+                echo "deleted stale vpn node $id"
+                sleep 2
+              done
           sudo tailscale up --authkey="$KEY" --hostname=vpn --accept-dns=false
           sudo tailscale status | head -5
 
@@ -103,6 +103,14 @@ jobs:
         run: |
           DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "DNS=$DN"
+          ip=""
+          for i in $(seq 1 40); do
+            ip=$(dig +short "$DN" @8.8.8.8 2>/dev/null | head -1)
+            [ -z "$ip" ] && ip=$(getent hosts "$DN" 2>/dev/null | awk '{print $1}' | head -1)
+            [ -n "$ip" ] && { echo "public DNS ready: $DN -> $ip"; break; }
+            echo "waiting for public DNS publication ($i)..."
+            sleep 10
+          done
           sudo tee /tmp/probe-ws.json >/dev/null <<EOF
           {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10821,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$DN","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$DN","fingerprint":"chrome"},"wsSettings":{"path":"/ws","host":"$DN"}}}]}
           EOF
