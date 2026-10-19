@@ -77,16 +77,23 @@ jobs:
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
           echo "::add-mask::$KEY"
-          # pin hostname: delete ALL stale vpn* nodes (runs are serialized -> none active)
-          curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices \
-            | jq -r '.devices[] | select(.hostname | startswith("vpn")) | .id' \
-            | while read -r id; do
-                [ -n "$id" ] || continue
-                curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" >/dev/null
-                echo "deleted stale vpn node $id"
-                sleep 2
-              done
-          sudo tailscale up --authkey="$KEY" --hostname=vpn --accept-dns=false
+          for round in 1 2 3; do
+            STALE=$(curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices \
+              | jq -r '.devices[] | select(.hostname | startswith("vpn")) | .id')
+            for id in $STALE; do
+              [ -n "$id" ] || continue
+              curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$id" >/dev/null
+              echo "deleted stale vpn node $id"
+              sleep 2
+            done
+            sudo tailscale up --authkey="$KEY" --hostname=vpn --accept-dns=false
+            SELF_DN=$(sudo tailscale status --json | jq -r '.Self.DNSName')
+            if [ "$SELF_DN" = "vpn.taila273c8.ts.net." ]; then echo "hostname OK: $SELF_DN"; break; fi
+            echo "hostname collision ($SELF_DN) — deleting self and retrying (round $round)"
+            SELF_ID=$(sudo tailscale status --json | jq -r '.Self.ID')
+            curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$SELF_ID" >/dev/null || true
+            sleep 5
+          done
           sudo tailscale status | head -5
 
       - name: Enable Funnel (443 -> WS, 8443 -> XHTTP)
@@ -97,20 +104,45 @@ jobs:
           sudo tailscale serve status
           echo "Self DNS: $(sudo tailscale status --json | jq -r '.Self.DNSName')"
 
-      - name: E2E self-test through public Funnel
+      - name: E2E phase 1 (wait for real public TLS through funnel)
+        run: |
+          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "DNS=$DN"
+          tls=""
+          for i in $(seq 1 54); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$DN/" 2>/dev/null || true)
+            if [ -n "$code" ] && [ "$code" != "000" ]; then echo "TLS/HTTP healthy after $i checks (HTTP $code)"; tls=1; break; fi
+            if [ "$i" -eq 15 ] || [ "$i" -eq 36 ]; then
+              echo "[$i] TLS still down — bouncing funnel 443"
+              sudo tailscale funnel --https=443 off >/dev/null 2>&1 || true
+              sleep 3
+              sudo tailscale funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
+            fi
+            if [ "$i" -eq 48 ]; then
+              echo "[$i] bouncing funnel 8443"
+              sudo tailscale funnel --https=8443 off >/dev/null 2>&1 || true
+              sleep 3
+              sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082 >> /tmp/funnel8443.log 2>&1 || true
+            fi
+            if [ $((i % 5)) -eq 0 ]; then
+              A=$(dig +short "$DN" @8.8.8.8 2>/dev/null | head -1)
+              B=$(dig +short "$DN" @1.1.1.1 2>/dev/null | head -1)
+              echo "[$i/54] tls=$code DNS(g8)=$A DNS(11)=$B"
+            fi
+            sleep 10
+          done
+          if [ -z "$tls" ]; then
+            echo "TLS NEVER BECAME HEALTHY — dumping diagnostics"
+            sudo tailscale serve status || true
+            sudo cat /tmp/funnel443.log /tmp/funnel8443.log /tmp/xray.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: E2E phase 2 (full VLESS probe over WS + XHTTP)
         env:
           XRAY_UUID: ${{ secrets.XRAY_UUID }}
         run: |
           DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
-          echo "DNS=$DN"
-          ip=""
-          for i in $(seq 1 40); do
-            ip=$(dig +short "$DN" @8.8.8.8 2>/dev/null | head -1)
-            [ -z "$ip" ] && ip=$(getent hosts "$DN" 2>/dev/null | awk '{print $1}' | head -1)
-            [ -n "$ip" ] && { echo "public DNS ready: $DN -> $ip"; break; }
-            echo "waiting for public DNS publication ($i)..."
-            sleep 10
-          done
           sudo tee /tmp/probe-ws.json >/dev/null <<EOF
           {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10821,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$DN","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$DN","fingerprint":"chrome"},"wsSettings":{"path":"/ws","host":"$DN"}}}]}
           EOF
@@ -121,15 +153,15 @@ jobs:
           sudo nohup /opt/xray/xray run -c /tmp/probe-xh.json > /tmp/probe-xh.log 2>&1 &
           sleep 4
           ok=""
-          for i in $(seq 1 30); do
+          for i in $(seq 1 20); do
             W=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || true)
             X=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 https://api.ipify.org || true)
             if [ -n "$W" ] && [ -n "$X" ]; then ok=1; echo "attempt $i: WS=$W XHTTP=$X"; break; fi
-            echo "attempt $i: waiting for funnel certs..."
-            sleep 10
+            echo "attempt $i: probes pending..."
+            sleep 15
           done
           if [ -z "$ok" ]; then
-            echo "E2E FAILED — dumping diagnostics"
+            echo "E2E PROBES FAILED — dumping diagnostics"
             sudo tailscale serve status || true
             sudo cat /tmp/funnel443.log /tmp/funnel8443.log /tmp/xray.log /tmp/probe-ws.log /tmp/probe-xh.log 2>/dev/null || true
             exit 1
@@ -151,12 +183,12 @@ jobs:
             echo ""
             echo "- Node: **${DN}**"
             echo "- WS: 443 → /ws | XHTTP: 8443 → /"
-            echo "- Renewed automatically every 6 hours"
+            echo "- Auto-renewed by self-chaining (~5.5h), cron backstop"
             echo ""
             echo "🔐 Full vless configs were sent to your Telegram."
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            MSG="✅ VPN Server (GitHub Action) ONLINE"$'\n\n'"${WS}"$'\n\n'"${XH}"$'\n\n'"⏳ تقریبا ۶ ساعت معتبره — هر ۶ ساعت خودکار تازه میشه و کانفیگ جدید میاد همینجا."
+            MSG="✅ VPN Server (GitHub Action) ONLINE"$'\n\n'"${WS}"$'\n\n'"${XH}"$'\n\n'"♻️ خودکار تازه‌سازی میشه (زنجیره‌ی ۲۴/۷) — کانفیگ‌ها ثابتن و همینه."
             curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_CHAT_ID}" \
               --data-urlencode "text=${MSG}" > /tmp/tg.json
@@ -165,29 +197,72 @@ jobs:
             echo "TG secrets not set, skipping telegram"
           fi
 
-      - name: Keep alive (6h watchdog)
+      - name: Keep alive (watchdog + pre-chain at min 310)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          for i in $(seq 1 325); do
+          for i in $(seq 1 315); do
             pgrep -x xray >/dev/null || {
               echo "[$i] xray died — respawning"
               sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json >> /tmp/xray.log 2>&1 &
             }
-            [ $((i % 30)) -eq 0 ] && echo "[$i/325] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"
+            if [ "$i" -eq 310 ]; then
+              PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
+                | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
+              if [ "$PENDING" = "0" ]; then
+                HTTP=$(curl -s -o /tmp/chain.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/dispatches" \
+                  -d '{"ref":"main"}')
+                echo "pre-chain dispatch HTTP $HTTP $(cat /tmp/chain.json)"
+              else
+                echo "pre-chain skipped: $PENDING run(s) already active"
+              fi
+            fi
+            if [ $((i % 30)) -eq 0 ]; then echo "[$i/315] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"; fi
             sleep 60
           done
 
-      - name: Chain next run (zero-gap 24/7)
+      - name: Chain next run (success fallback)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
-            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "pending" or .status == "in_progress"))] | length')
+            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
           if [ "$PENDING" = "0" ]; then
-            curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            HTTP=$(curl -s -o /tmp/chain2.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/dispatches" \
-              -d '{"ref":"main"}' && echo "chained: next run dispatched (zero-gap 24/7)"
+              -d '{"ref":"main"}')
+            echo "fallback chain dispatch HTTP $HTTP $(cat /tmp/chain2.json)"
           else
             echo "a run is already queued/in-progress ($PENDING) — chain skipped"
+          fi
+
+      - name: Self-heal restart on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          echo "run failed — self-heal: cooling down 3 min then dispatching a fresh run"
+          curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=⚠️ VPN run failed — self-heal فعال شد، ۳ دقیقه بعد run تازه بالا میاد." >/dev/null 2>&1 || true
+          sleep 180
+          PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
+            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
+          if [ "$PENDING" = "0" ]; then
+            HTTP=$(curl -s -o /tmp/heal.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "self-heal dispatch HTTP $HTTP $(cat /tmp/heal.json)"
+          else
+            echo "a run is already active ($PENDING) — self-heal dispatch skipped"
           fi
