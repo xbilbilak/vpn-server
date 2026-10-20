@@ -126,16 +126,16 @@ jobs:
           DN=$($TS status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "DNS=$DN"
           tls=""
-          for i in $(seq 1 54); do
+          for i in $(seq 1 130); do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$DN/" 2>/dev/null || true)
             if [ -n "$code" ] && [ "$code" != "000" ]; then echo "TLS/HTTP healthy after $i checks (HTTP $code)"; tls=1; break; fi
-            if [ "$i" -eq 15 ] || [ "$i" -eq 36 ]; then
+            if [ "$i" -eq 20 ] || [ "$i" -eq 60 ]; then
               echo "[$i] TLS still down — bouncing funnel 443"
               $TS funnel --https=443 off >/dev/null 2>&1 || true
               sleep 3
               $TS funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
             fi
-            if [ "$i" -eq 48 ]; then
+            if [ "$i" -eq 110 ]; then
               echo "[$i] bouncing funnel 8443"
               $TS funnel --https=8443 off >/dev/null 2>&1 || true
               sleep 3
@@ -144,7 +144,7 @@ jobs:
             if [ $((i % 5)) -eq 0 ]; then
               A=$(dig +short "$DN" @8.8.8.8 2>/dev/null | head -1)
               B=$(dig +short "$DN" @1.1.1.1 2>/dev/null | head -1)
-              echo "[$i/54] tls=$code DNS(g8)=$A DNS(11)=$B"
+              echo "[$i/130] tls=$code DNS(g8)=$A DNS(11)=$B"
             fi
             sleep 10
           done
@@ -172,7 +172,7 @@ jobs:
           sudo nohup /opt/xray/xray run -c /tmp/probe-xh.json > /tmp/probe-xh.log 2>&1 &
           sleep 4
           ok=""
-          for i in $(seq 1 20); do
+          for i in $(seq 1 26); do
             W=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || true)
             X=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 https://api.ipify.org || true)
             if [ -n "$W" ] && [ -n "$X" ]; then ok=1; echo "attempt $i: WS=$W XHTTP=$X"; break; fi
@@ -216,11 +216,11 @@ jobs:
             echo "TG secrets not set, skipping telegram"
           fi
 
-      - name: Keep alive (watchdog + pre-chain at min 310)
+      - name: Keep alive (watchdog + pre-chain at min 295)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for i in $(seq 1 315); do
+          for i in $(seq 1 300); do
             pgrep -x xray >/dev/null || {
               echo "[$i] xray died — respawning"
               sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json >> /tmp/xray.log 2>&1 &
@@ -235,7 +235,7 @@ jobs:
               sudo /opt/ts/tailscale --socket=/tmp/ts.sock funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
               sudo /opt/ts/tailscale --socket=/tmp/ts.sock funnel --bg --https=8443 http://127.0.0.1:8082 >> /tmp/funnel8443.log 2>&1 || true
             fi
-            if [ "$i" -eq 310 ]; then
+            if [ "$i" -eq 295 ]; then
               PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
                 | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
@@ -249,7 +249,7 @@ jobs:
                 echo "pre-chain skipped: $PENDING run(s) already active"
               fi
             fi
-            if [ $((i % 30)) -eq 0 ]; then echo "[$i/315] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"; fi
+            if [ $((i % 30)) -eq 0 ]; then echo "[$i/300] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || echo probe-down)"; fi
             sleep 60
           done
 
