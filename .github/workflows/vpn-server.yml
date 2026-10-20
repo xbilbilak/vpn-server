@@ -84,6 +84,14 @@ jobs:
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
           echo "::add-mask::$KEY"
+          # Force home DERP to Hong Kong (proven working funnel ingress path):
+          # blind every other DERP region via /etc/hosts so netcheck can only reach hkg
+          curl -s https://controlplane.tailscale.com/derpmap/default -o /tmp/derpmap.json
+          jq -r '.Regions | to_entries[] | select(.key != "20") | .value.Nodes[].HostName' /tmp/derpmap.json | sort -u | while read h; do
+            echo "127.0.0.1 $h" | sudo tee -a /etc/hosts >/dev/null
+          done
+          echo "HKG nodes kept: $(jq -r '.Regions["20"].Nodes[].HostName' /tmp/derpmap.json | tr '\n' ' ')"
+          echo "blinded $(grep -c '127.0.0.1 derp' /etc/hosts || true) DERP hosts"
           for round in 1 2 3; do
             STALE=$(curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices \
               | jq -r '.devices[] | select(.hostname | startswith("vpn") or startswith("edge")) | .id')
