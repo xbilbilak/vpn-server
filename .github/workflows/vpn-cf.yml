@@ -1,0 +1,214 @@
+name: VPN Server (Xray + Cloudflare Quick Tunnel)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 */6 * * *'
+
+concurrency:
+  group: vpn-cf
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  vpn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Xray + cloudflared
+        run: |
+          curl -sL -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          sudo mkdir -p /opt/xray && sudo unzip -o /tmp/xray.zip -d /opt/xray && sudo chmod +x /opt/xray/xray
+          curl -sL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          /opt/xray/xray version | head -1
+          cloudflared --version
+
+      - name: Write Xray config and start
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+        run: |
+          sudo mkdir -p /opt/xray/etc
+          sudo tee /opt/xray/etc/config.json >/dev/null <<EOF
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+              {
+                "listen": "127.0.0.1",
+                "port": 8081,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "${XRAY_UUID}", "level": 8}], "decryption": "none"},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}},
+                "sniffing": {"enabled": true}
+              },
+              {
+                "listen": "127.0.0.1",
+                "port": 8082,
+                "protocol": "vless",
+                "settings": {"clients": [{"id": "${XRAY_UUID}", "level": 8}], "decryption": "none"},
+                "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/", "mode": "auto"}},
+                "sniffing": {"enabled": true}
+              }
+            ],
+            "outbounds": [
+              {"protocol": "freedom", "tag": "direct"},
+              {"protocol": "blackhole", "tag": "block"}
+            ]
+          }
+          EOF
+          sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json > /tmp/xray.log 2>&1 &
+          sleep 3
+          ss -tlnp | grep -E '8081|8082' && echo "XRAY LISTENING OK"
+
+      - name: Start Cloudflare quick tunnels (XHTTP + WS)
+        run: |
+          sudo nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8082 > /tmp/cf-xh.log 2>&1 &
+          sudo nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8081 > /tmp/cf-ws.log 2>&1 &
+          XHURL=""
+          WSURL=""
+          for i in $(seq 1 20); do
+            [ -z "$XHURL" ] && XHURL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf-xh.log 2>/dev/null | head -1)
+            [ -z "$WSURL" ] && WSURL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf-ws.log 2>/dev/null | head -1)
+            [ -n "$XHURL" ] && [ -n "$WSURL" ] && break
+            sleep 5
+          done
+          echo "XHTTP tunnel: $XHURL"
+          echo "WS tunnel:    $WSURL"
+          [ -n "$XHURL" ] && [ -n "$WSURL" ] || { echo "TUNNEL SETUP FAILED"; tail -30 /tmp/cf-xh.log /tmp/cf-ws.log; exit 1; }
+          echo "XHURL=$XHURL" >> "$GITHUB_ENV"
+          echo "WSURL=$WSURL" >> "$GITHUB_ENV"
+
+      - name: E2E self-test through Cloudflare
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+        run: |
+          HX="${XHURL#https://}"
+          HW="${WSURL#https://}"
+          sudo tee /tmp/probe-xh.json >/dev/null <<EOF
+          {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10822,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$HX","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"$HX","fingerprint":"chrome"},"xhttpSettings":{"path":"/","mode":"auto","host":"$HX"}}}]}
+          EOF
+          sudo tee /tmp/probe-ws.json >/dev/null <<EOF
+          {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10821,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$HW","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$HW","fingerprint":"chrome"},"wsSettings":{"path":"/ws","host":"$HW"}}}]}
+          EOF
+          sudo nohup /opt/xray/xray run -c /tmp/probe-xh.json > /tmp/probe-xh.log 2>&1 &
+          sudo nohup /opt/xray/xray run -c /tmp/probe-ws.json > /tmp/probe-ws.log 2>&1 &
+          sleep 4
+          ok=""
+          for i in $(seq 1 20); do
+            X=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 https://api.ipify.org || true)
+            W=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 https://api.ipify.org || true)
+            if [ -n "$X" ] && [ -n "$W" ]; then ok=1; echo "attempt $i: XHTTP=$X WS=$W"; break; fi
+            echo "attempt $i: probes pending..."
+            sleep 15
+          done
+          if [ -z "$ok" ]; then
+            echo "E2E FAILED — dumping diagnostics"
+            tail -30 /tmp/cf-xh.log /tmp/cf-ws.log /tmp/xray.log /tmp/probe-xh.log /tmp/probe-ws.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "XHTTP gstatic: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10822 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204)"
+          echo "WS    gstatic: $(curl -s --max-time 20 --socks5-hostname 127.0.0.1:10821 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204)"
+
+      - name: Send configs to Telegram + Summary
+        env:
+          XRAY_UUID: ${{ secrets.XRAY_UUID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          HX="${XHURL#https://}"
+          HW="${WSURL#https://}"
+          XH="vless://${XRAY_UUID}@${HX}:443?encryption=none&security=tls&sni=${HX}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${HX}#CF-XHTTP"
+          WS="vless://${XRAY_UUID}@${HW}:443?encryption=none&security=tls&sni=${HW}&fp=chrome&type=ws&host=${HW}&path=%2Fws#CF-WS"
+          {
+            echo "## ✅ VPN ONLINE (Cloudflare)"
+            echo ""
+            echo "- XHTTP: ${XHURL}"
+            echo "- WS: ${WSURL}"
+            echo "- ⚠️ URL per session changes — always use the newest Telegram config"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            MSG="✅ VPN Server (Cloudflare) ONLINE"$'\n\n'"${XH}"$'\n\n'"${WS}"$'\n\n'"⚠️ آدرس هر session عوض میشه — همیشه آخرین کانفیگ تلگرام رو import کن."
+            curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=${MSG}" > /tmp/tg.json
+            grep -q '"ok":true' /tmp/tg.json && echo "TELEGRAM SENT OK" || { echo "TELEGRAM FAILED:"; cat /tmp/tg.json; }
+          fi
+
+      - name: Keep alive (watchdog + pre-chain at min 295)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 300); do
+            pgrep -x xray >/dev/null || {
+              echo "[$i] xray died — respawning"
+              sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json >> /tmp/xray.log 2>&1 &
+            }
+            pgrep -x cloudflared >/dev/null || {
+              echo "[$i] cloudflared died — URL will change! respawning both tunnels"
+              sudo nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8082 >> /tmp/cf-xh.log 2>&1 &
+              sudo nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8081 >> /tmp/cf-ws.log 2>&1 &
+              sleep 8
+            }
+            if [ "$i" -eq 295 ]; then
+              PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/runs?per_page=15" \
+                | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
+              if [ "$PENDING" = "0" ]; then
+                HTTP=$(curl -s -o /tmp/chain.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/dispatches" \
+                  -d '{"ref":"main"}')
+                echo "pre-chain dispatch HTTP $HTTP $(cat /tmp/chain.json)"
+              else
+                echo "pre-chain skipped: $PENDING run(s) active"
+              fi
+            fi
+            if [ $((i % 30)) -eq 0 ]; then echo "[$i/300] alive — $(curl -s --max-time 10 --socks5-hostname 127.0.0.1:10822 https://api.ipify.org || echo probe-down)"; fi
+            sleep 60
+          done
+
+      - name: Chain next run (success fallback)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/runs?per_page=15" \
+            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
+          if [ "$PENDING" = "0" ]; then
+            HTTP=$(curl -s -o /tmp/chain2.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "fallback chain dispatch HTTP $HTTP $(cat /tmp/chain2.json)"
+          else
+            echo "a run is already queued/in-progress ($PENDING) — chain skipped"
+          fi
+
+      - name: Self-heal restart on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=⚠️ CF VPN run failed — self-heal: restart in 3 min" >/dev/null 2>&1 || true
+          sleep 180
+          PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/runs?per_page=15" \
+            | jq --arg rid "${{ github.run_id }}" '[.workflow_runs[] | select((.id | tostring) != $rid and (.status == "queued" or .status == "in_progress"))] | length')
+          if [ "$PENDING" = "0" ]; then
+            HTTP=$(curl -s -o /tmp/heal.json -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-cf.yml/dispatches" \
+              -d '{"ref":"main"}')
+            echo "self-heal dispatch HTTP $HTTP $(cat /tmp/heal.json)"
+          else
+            echo "a run is already active ($PENDING) — skipped"
+          fi
