@@ -84,14 +84,13 @@ jobs:
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           [ -n "$KEY" ] && [ "$KEY" != "null" ] || { echo "KEY MINT FAILED"; exit 1; }
           echo "::add-mask::$KEY"
-          # Force home DERP to Hong Kong (proven working funnel ingress path):
-          # blind every other DERP region via /etc/hosts so netcheck can only reach hkg
+          # Pin funnel path to a single DERP node (derp20b hkg = 103.6.84.152, proven working):
+          # block ALL other DERP server IPs at network layer so netcheck home = derp20b
           curl -s https://controlplane.tailscale.com/derpmap/default -o /tmp/derpmap.json
-          jq -r '.Regions | to_entries[] | select(.key != "20") | .value.Nodes[].HostName' /tmp/derpmap.json | sort -u | while read h; do
-            echo "127.0.0.1 $h" | sudo tee -a /etc/hosts >/dev/null
+          jq -r '.Regions | to_entries[] | .value.Nodes[] | (.IPv4 // empty)' /tmp/derpmap.json | sort -u | grep -v '^103.6.84.152$' | while read ip; do
+            [ -n "$ip" ] && sudo iptables -A OUTPUT -d "$ip" -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || true
           done
-          echo "HKG nodes kept: $(jq -r '.Regions["20"].Nodes[].HostName' /tmp/derpmap.json | tr '\n' ' ')"
-          echo "blinded $(grep -c '127.0.0.1 derp' /etc/hosts || true) DERP hosts"
+          echo "HKG pinned: derp20b 103.6.84.152; blocked DERP rules: $(sudo iptables -S OUTPUT 2>/dev/null | grep -c REJECT || echo 0)"
           for round in 1 2 3; do
             STALE=$(curl -s -H "Authorization: Bearer $ACCESS" https://api.tailscale.com/api/v2/tailnet/-/devices \
               | jq -r '.devices[] | select(.hostname | startswith("vpn") or startswith("edge")) | .id')
@@ -118,6 +117,13 @@ jobs:
           $TS funnel --bg --https=8443 http://127.0.0.1:8082 > /tmp/funnel8443.log 2>&1 || sudo cat /tmp/funnel8443.log
           sleep 5
           $TS serve status
+          DN=$($TS status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          echo "pre-warming cert for $DN (explicit retries)"
+          for t in $(seq 1 12); do
+            if $TS cert "$DN" -o /tmp/cert.crt -o-key /tmp/cert.key >/dev/null 2>&1; then echo "cert OK on try $t"; break; fi
+            echo "cert try $t failed — retrying in 20s"
+            sleep 20
+          done
           echo "Self DNS: $($TS status --json | jq -r '.Self.DNSName')"
 
       - name: E2E phase 1 (wait for real public TLS through funnel)
@@ -127,7 +133,7 @@ jobs:
           echo "DNS=$DN"
           tls=""
           for i in $(seq 1 130); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$DN/" 2>/dev/null || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 --resolve "$DN:443:103.6.84.152" "https://$DN/" 2>/dev/null || true)
             if [ -n "$code" ] && [ "$code" != "000" ]; then echo "TLS/HTTP healthy after $i checks (HTTP $code)"; tls=1; break; fi
             if [ "$i" -eq 20 ] || [ "$i" -eq 60 ]; then
               echo "[$i] TLS still down — bouncing funnel 443"
@@ -195,8 +201,10 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           DN=$(sudo /opt/ts/tailscale --socket=/tmp/ts.sock status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
-          WS="vless://${XRAY_UUID}@${DN}:443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=ws&host=${DN}&path=%2Fws#GH-Funnel-WS"
-          XH="vless://${XRAY_UUID}@${DN}:8443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${DN}#GH-Funnel-XHTTP"
+          WS="vless://${XRAY_UUID}@103.6.84.152:443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=ws&host=${DN}&path=%2Fws#VPN-HKG-WS"
+          XH="vless://${XRAY_UUID}@103.6.84.152:8443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${DN}#VPN-HKG-XHTTP"
+          WSD="vless://${XRAY_UUID}@${DN}:443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=ws&host=${DN}&path=%2Fws#VPN-DNS-WS"
+          XHD="vless://${XRAY_UUID}@${DN}:8443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${DN}#VPN-DNS-XHTTP"
           {
             echo "## ✅ VPN Server ONLINE"
             echo ""
@@ -207,7 +215,7 @@ jobs:
             echo "🔐 Full vless configs were sent to your Telegram."
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            MSG="✅ VPN Server (GitHub Action) ONLINE"$'\n\n'"${WS}"$'\n\n'"${XH}"$'\n\n'"♻️ خودکار تازه‌سازی میشه (زنجیره‌ی ۲۴/۷) — کانفیگ‌ها ثابتن و همینه."
+            MSG="✅ VPN Server ONLINE"$'\n\n'"🔹 کانفیگ اصلی (سنجاق‌شده روی HKG):"$'\n'"${WS}"$'\n\n'"🔹 XHTTP اصلی:"$'\n'"${XH}"$'\n\n'"🔹 نسخه‌ی جایگزین (DNS):"$'\n'"${WSD}"$'\n\n'"${XHD}"$'\n\n'"♻️ خودکار تازه‌سازی میشه (زنجیره‌ی ۲۴/۷) — کانفیگ‌ها ثابتن و همینه."
             curl -sG "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${TG_CHAT_ID}" \
               --data-urlencode "text=${MSG}" > /tmp/tg.json
