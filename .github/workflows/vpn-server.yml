@@ -63,12 +63,19 @@ jobs:
           sleep 3
           ss -tlnp | grep -E '8081|8082' && echo "XRAY LISTENING OK"
 
-      - name: Join Tailscale (OAuth -> fresh ephemeral key)
+      - name: Start tailscaled (userspace mode) + Join (OAuth -> fresh ephemeral key)
         env:
           TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          curl -sL -o /tmp/ts.tgz https://pkgs.tailscale.com/stable/tailscale_1.104.1_amd64.tgz
+          sudo mkdir -p /opt/ts && sudo tar xzf /tmp/ts.tgz -C /opt/ts --strip-components=1
+          sudo chmod +x /opt/ts/tailscale /opt/ts/tailscaled
+          /opt/ts/tailscale version | head -1
+          sudo mkdir -p /tmp/tsstate
+          sudo nohup /opt/ts/tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/ts.sock > /tmp/tailscaled.log 2>&1 &
+          sleep 4
+          TS="sudo /opt/ts/tailscale --socket=/tmp/ts.sock"
           ACCESS=$(curl -s -u "${TS_OAUTH_CLIENT_ID}:${TS_OAUTH_CLIENT_SECRET}" \
             -d grant_type=client_credentials https://api.tailscale.com/api/v2/oauth/token | jq -r .access_token)
           [ -n "$ACCESS" ] && [ "$ACCESS" != "null" ] || { echo "OAUTH FAILED"; exit 1; }
@@ -86,27 +93,29 @@ jobs:
               echo "deleted stale node $id"
               sleep 2
             done
-            sudo tailscale up --authkey="$KEY" --hostname=edge1 --accept-dns=false
-            SELF_DN=$(sudo tailscale status --json | jq -r '.Self.DNSName')
+            $TS up --authkey="$KEY" --hostname=edge1 --accept-dns=false
+            SELF_DN=$($TS status --json | jq -r '.Self.DNSName')
             if [ "$SELF_DN" = "edge1.taila273c8.ts.net." ]; then echo "hostname OK: $SELF_DN"; break; fi
             echo "hostname mismatch/collision ($SELF_DN) — deleting self and retrying (round $round)"
-            SELF_ID=$(sudo tailscale status --json | jq -r '.Self.ID')
+            SELF_ID=$($TS status --json | jq -r '.Self.ID')
             curl -s -X DELETE -H "Authorization: Bearer $ACCESS" "https://api.tailscale.com/api/v2/device/$SELF_ID" >/dev/null || true
             sleep 5
           done
-          sudo tailscale status | head -5
+          $TS status | head -5
 
       - name: Enable Funnel (443 -> WS, 8443 -> XHTTP)
         run: |
-          sudo tailscale funnel --bg 8081 > /tmp/funnel443.log 2>&1 || sudo cat /tmp/funnel443.log
-          sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082 > /tmp/funnel8443.log 2>&1 || sudo cat /tmp/funnel8443.log
+          TS="sudo /opt/ts/tailscale --socket=/tmp/ts.sock"
+          $TS funnel --bg 8081 > /tmp/funnel443.log 2>&1 || sudo cat /tmp/funnel443.log
+          $TS funnel --bg --https=8443 http://127.0.0.1:8082 > /tmp/funnel8443.log 2>&1 || sudo cat /tmp/funnel8443.log
           sleep 5
-          sudo tailscale serve status
-          echo "Self DNS: $(sudo tailscale status --json | jq -r '.Self.DNSName')"
+          $TS serve status
+          echo "Self DNS: $($TS status --json | jq -r '.Self.DNSName')"
 
       - name: E2E phase 1 (wait for real public TLS through funnel)
         run: |
-          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          TS="sudo /opt/ts/tailscale --socket=/tmp/ts.sock"
+          DN=$($TS status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           echo "DNS=$DN"
           tls=""
           for i in $(seq 1 54); do
@@ -114,15 +123,15 @@ jobs:
             if [ -n "$code" ] && [ "$code" != "000" ]; then echo "TLS/HTTP healthy after $i checks (HTTP $code)"; tls=1; break; fi
             if [ "$i" -eq 15 ] || [ "$i" -eq 36 ]; then
               echo "[$i] TLS still down — bouncing funnel 443"
-              sudo tailscale funnel --https=443 off >/dev/null 2>&1 || true
+              $TS funnel --https=443 off >/dev/null 2>&1 || true
               sleep 3
-              sudo tailscale funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
+              $TS funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
             fi
             if [ "$i" -eq 48 ]; then
               echo "[$i] bouncing funnel 8443"
-              sudo tailscale funnel --https=8443 off >/dev/null 2>&1 || true
+              $TS funnel --https=8443 off >/dev/null 2>&1 || true
               sleep 3
-              sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082 >> /tmp/funnel8443.log 2>&1 || true
+              $TS funnel --bg --https=8443 http://127.0.0.1:8082 >> /tmp/funnel8443.log 2>&1 || true
             fi
             if [ $((i % 5)) -eq 0 ]; then
               A=$(dig +short "$DN" @8.8.8.8 2>/dev/null | head -1)
@@ -133,7 +142,9 @@ jobs:
           done
           if [ -z "$tls" ]; then
             echo "TLS NEVER BECAME HEALTHY — dumping diagnostics"
-            sudo tailscale serve status || true
+            $TS serve status || true
+            $TS netcheck 2>&1 | head -30 || true
+            sudo tail -40 /tmp/tailscaled.log 2>/dev/null || true
             sudo cat /tmp/funnel443.log /tmp/funnel8443.log /tmp/xray.log 2>/dev/null || true
             exit 1
           fi
@@ -142,7 +153,7 @@ jobs:
         env:
           XRAY_UUID: ${{ secrets.XRAY_UUID }}
         run: |
-          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          DN=$(sudo /opt/ts/tailscale --socket=/tmp/ts.sock status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           sudo tee /tmp/probe-ws.json >/dev/null <<EOF
           {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":10821,"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$DN","port":443,"users":[{"id":"${XRAY_UUID}","encryption":"none","level":8}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"$DN","fingerprint":"chrome"},"wsSettings":{"path":"/ws","host":"$DN"}}}]}
           EOF
@@ -162,7 +173,7 @@ jobs:
           done
           if [ -z "$ok" ]; then
             echo "E2E PROBES FAILED — dumping diagnostics"
-            sudo tailscale serve status || true
+            sudo /opt/ts/tailscale --socket=/tmp/ts.sock serve status || true
             sudo cat /tmp/funnel443.log /tmp/funnel8443.log /tmp/xray.log /tmp/probe-ws.log /tmp/probe-xh.log 2>/dev/null || true
             exit 1
           fi
@@ -175,7 +186,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
-          DN=$(sudo tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
+          DN=$(sudo /opt/ts/tailscale --socket=/tmp/ts.sock status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
           WS="vless://${XRAY_UUID}@${DN}:443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=ws&host=${DN}&path=%2Fws#GH-Funnel-WS"
           XH="vless://${XRAY_UUID}@${DN}:8443?encryption=none&security=tls&sni=${DN}&fp=chrome&type=xhttp&path=%2F&mode=auto&host=${DN}#GH-Funnel-XHTTP"
           {
@@ -206,6 +217,16 @@ jobs:
               echo "[$i] xray died — respawning"
               sudo nohup /opt/xray/xray run -c /opt/xray/etc/config.json >> /tmp/xray.log 2>&1 &
             }
+            if ! sudo /opt/ts/tailscale --socket=/tmp/ts.sock status >/dev/null 2>&1; then
+              echo "[$i] tailscale down — restarting daemon + funnel"
+              sudo pkill -x tailscaled 2>/dev/null || true
+              sudo rm -f /tmp/ts.sock
+              sudo nohup /opt/ts/tailscaled --tun=userspace-networking --statedir=/tmp/tsstate --socket=/tmp/ts.sock >> /tmp/tailscaled.log 2>&1 &
+              sleep 4
+              sudo /opt/ts/tailscale --socket=/tmp/ts.sock up --accept-dns=false --hostname=edge1 || true
+              sudo /opt/ts/tailscale --socket=/tmp/ts.sock funnel --bg 8081 >> /tmp/funnel443.log 2>&1 || true
+              sudo /opt/ts/tailscale --socket=/tmp/ts.sock funnel --bg --https=8443 http://127.0.0.1:8082 >> /tmp/funnel8443.log 2>&1 || true
+            fi
             if [ "$i" -eq 310 ]; then
               PENDING=$(curl -s -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/vpn-server.yml/runs?per_page=15" \
